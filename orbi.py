@@ -146,9 +146,11 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 eleven = ElevenLabs(api_key=ELEVENLABS_API_KEY) if ELEVENLABS_API_KEY else None
  
-# Load local Whisper once at startup (small + fast; CPU is fine)
+# Load local Whisper once at startup — GPU on Jetson, CPU in dev
 print("Loading Whisper...", flush=True)
-whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+_whisper_device = "cpu" if DEV_MODE else "cuda"
+_whisper_compute = "int8" if DEV_MODE else "float16"
+whisper = WhisperModel(WHISPER_MODEL, device=_whisper_device, compute_type=_whisper_compute)
  
 # ═══════════════════════════════════════════════════════════════════════════
 # ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
