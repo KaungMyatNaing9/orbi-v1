@@ -56,6 +56,10 @@ DEV_MODE = os.getenv("ORBI_DEV_MODE", "1") == "1"  # EDIT: "0" on Jetson
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
  
+# --- LLM backend -----------------------------------------------------------
+# 1 = Gemini (cloud), 2 = Gemma 4 via Ollama (local, no internet needed)
+LLM_BACKEND = int(os.getenv("ORBI_LLM", "1"))
+
 # --- Models ----------------------------------------------------------------
 GEMINI_MODEL = "gemini-2.0-flash"                  # EDIT: try 2.5-flash if available
 GEMMA_LOCAL_MODEL = "gemma4:e4b"                   # EDIT: e2b if VRAM-tight
@@ -445,7 +449,13 @@ def _think_gemma(user_text: str) -> str:
  
  
 def think(user_text: str) -> str:
-    """Route to Gemini; fall back to Gemma 4 on failure."""
+    """Route to Gemini or Gemma 4 based on ORBI_LLM (1=Gemini, 2=Gemma)."""
+    if LLM_BACKEND == 2:
+        try:
+            return _think_gemma(user_text)
+        except Exception as e:
+            return f"(my brain is having a moment — {e})"
+    # LLM_BACKEND == 1: Gemini with Gemma fallback
     if _gemini_chat is not None:
         try:
             return _think_gemini(user_text)
