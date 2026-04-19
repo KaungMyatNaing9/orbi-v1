@@ -39,6 +39,7 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
 from faster_whisper import WhisperModel
+from dashboard import dashboard
  
 # Load .env file if present (silently does nothing if absent)
 load_dotenv()
@@ -53,7 +54,9 @@ load_dotenv()
 DEV_MODE = os.getenv("ORBI_DEV_MODE", "1") == "1"  # EDIT: "0" on Jetson
  
 # --- API keys --------------------------------------------------------------
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
+OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
  
 # --- LLM backend -----------------------------------------------------------
@@ -61,8 +64,8 @@ ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 LLM_BACKEND = int(os.getenv("ORBI_LLM", "1"))
 
 # --- Models ----------------------------------------------------------------
-GEMINI_MODEL = "gemini-2.0-flash"                  # EDIT: try 2.5-flash if available
-GEMMA_LOCAL_MODEL = "gemma4:e4b"                   # EDIT: e2b if VRAM-tight
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMMA_LOCAL_MODEL = os.getenv("ORBI_LOCAL_MODEL", "gemma4:e2b")
 WHISPER_MODEL = "base"                             # EDIT: tiny/base/small
  
 # --- Voice -----------------------------------------------------------------
@@ -76,15 +79,21 @@ ESP32_PORT = os.getenv("ORBI_ESP32_PORT",
     "/dev/ttyACM0")                                # EDIT on Jetson if needed
 ESP32_BAUD = 115200
 MIC_SAMPLE_RATE = 16000
+
+# --- Motor timing (tune these on real hardware) ----------------------------
+MS_PER_CM     = 20   # ms of motor run per cm  (forward / backward)
+MS_PER_DEGREE = 8    # ms of motor run per degree (turning)
  
 # --- Storage ---------------------------------------------------------------
 MEMORY_PATH = pathlib.Path.home() / ".orbi" / "memory.jsonl"
 MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
  
 # --- Behavior --------------------------------------------------------------
-VAD_AGGRESSIVENESS = 2          # 0–3; higher = rejects more non-speech
-SILENCE_MS = 800                # ms of silence before Orbi considers you done
+VAD_AGGRESSIVENESS = 3          # 0–3; 3 = most aggressive noise rejection
+SILENCE_MS = 1200               # ms of silence before utterance is considered done
 MAX_UTTERANCE_S = 20            # safety cap on listening window
+MIN_WORDS = 3                   # ignore transcripts shorter than this
+LLM_COOLDOWN_S = 4.0            # min seconds between LLM calls (avoids 429s)
  
 # ═══════════════════════════════════════════════════════════════════════════
 # ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
@@ -264,7 +273,9 @@ def tool_see(what_to_look_for: str) -> str:
               f"Keep it to 2 sentences max. Be concrete — name objects, "
               f"people, positions. If you can't find what was asked about, "
               f"say so plainly.")
-    return vision(frame, prompt)
+    result = vision(frame, prompt)
+    dashboard.vision(frame, result)
+    return result
  
  
 def tool_move(direction: str, amount: int = 30) -> str:
@@ -284,9 +295,9 @@ def tool_move(direction: str, amount: int = 30) -> str:
     if direction == "stop":
         cmd = {"cmd": "stop"}
     elif direction in ("forward", "backward"):
-        cmd = {"cmd": direction, "speed": 50, "distance_cm": amount}
+        cmd = {"cmd": direction, "duration_ms": amount * MS_PER_CM}
     elif direction in ("left", "right"):
-        cmd = {"cmd": f"turn_{direction}", "degrees": amount}
+        cmd = {"cmd": f"turn_{direction}", "duration_ms": amount * MS_PER_DEGREE}
     else:
         return f"I don't know the direction '{direction}'."
     try:
@@ -448,23 +459,93 @@ def _think_gemma(user_text: str) -> str:
     return "I got stuck thinking. Let's try again."
  
  
+def _think_openai(user_text: str) -> str:
+    """OpenAI GPT with manual tool loop (same schema format as Ollama)."""
+    from openai import OpenAI
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    messages = [{"role": "system", "content": SOUL}]
+    for turn in conversation_history[-10:]:
+        messages.append(turn)
+    messages.append({"role": "user", "content": user_text})
+
+    for _ in range(5):
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=OLLAMA_TOOL_SCHEMAS,
+        )
+        msg = resp.choices[0].message
+        tool_calls = msg.tool_calls or []
+        if not tool_calls:
+            return (msg.content or "...").strip()
+        messages.append(msg)
+        for call in tool_calls:
+            fn_name = call.function.name
+            args = json.loads(call.function.arguments)
+            try:
+                result = TOOL_FNS[fn_name](**args)
+            except Exception as e:
+                result = f"Tool error: {e}"
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": str(result),
+            })
+    return "I got stuck thinking. Let's try again."
+
+
+def _think_claude(user_text: str) -> str:
+    """Claude Haiku as last-resort fallback. Basic conversation, no tools."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    messages = []
+    for turn in conversation_history[-10:]:
+        messages.append(turn)
+    messages.append({"role": "user", "content": user_text})
+    resp = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=512,
+        system=SOUL,
+        messages=messages,
+    )
+    return resp.content[0].text.strip()
+
+
 def think(user_text: str) -> str:
-    """Route to Gemini or Gemma 4 based on ORBI_LLM (1=Gemini, 2=Gemma)."""
+    """Cloud chain: Gemini → OpenAI → Claude → local Gemma (ORBI_LLM=2 skips cloud)."""
+    dashboard.status("thinking")
+
     if LLM_BACKEND == 2:
         try:
             return _think_gemma(user_text)
         except Exception as e:
             return f"(my brain is having a moment — {e})"
-    # LLM_BACKEND == 1: Gemini with Gemma fallback
-    if _gemini_chat is not None:
+
+    if GEMINI_API_KEY and _gemini_chat:
         try:
             return _think_gemini(user_text)
         except Exception as e:
-            print(f"  [gemini failed: {e}, falling back to Gemma 4]")
+            msg = f"  [gemini: {e}] → OpenAI"
+            print(msg); dashboard.log(msg)
+
+    if OPENAI_API_KEY:
+        try:
+            return _think_openai(user_text)
+        except Exception as e:
+            msg = f"  [openai: {e}] → Claude"
+            print(msg); dashboard.log(msg)
+
+    if ANTHROPIC_API_KEY:
+        try:
+            return _think_claude(user_text)
+        except Exception as e:
+            msg = f"  [claude: {e}] → local Gemma"
+            print(msg); dashboard.log(msg)
+
     try:
         return _think_gemma(user_text)
     except Exception as e:
-        return f"(my brain is having a moment — {e})"
+        return f"(all backends failed — {e})"
  
  
 # ═══════════════════════════════════════════════════════════════════════════
@@ -479,8 +560,9 @@ def listen() -> str:
     # If Orbi is speaking, wait until done — don't hear ourselves.
     if IS_SPEAKING.is_set():
         IS_SPEAKING.wait()
-        time.sleep(0.3)  # short guard against lingering echo
- 
+        time.sleep(0.3)
+
+    dashboard.status("listening")
     vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
     pa = pyaudio.PyAudio()
     frame_duration_ms = 30
@@ -547,28 +629,29 @@ def listen() -> str:
 # ═══════════════════════════════════════════════════════════════════════════
  
 def speak(text: str) -> None:
-    """Speak via ElevenLabs. Holds IS_SPEAKING so listen() stays quiet."""
+    """Speak via ElevenLabs. Streams audio to dashboard (Mac browser plays it)."""
     if not text:
         return
     print(f"🤖 Orbi: {text}")
     if eleven is None:
+        dashboard.status("idle")
         return
     try:
         IS_SPEAKING.set()
+        dashboard.status("speaking")
         audio_stream = eleven.text_to_speech.convert(
             voice_id=ELEVEN_VOICE_ID, text=text,
             model_id=ELEVEN_MODEL, output_format="mp3_44100_128",
         )
         audio_bytes = b"".join(audio_stream)
-        import subprocess
-        subprocess.run(
-            ["ffplay", "-autoexit", "-nodisp", "-loglevel", "quiet", "-"],
-            input=audio_bytes, check=False,
-        )
+        dashboard.audio(audio_bytes)
+        # Block while browser plays (~0.45s per word)
+        time.sleep(max(1.5, len(text.split()) * 0.45))
     except Exception as e:
         print(f"  [speak error: {e}]")
     finally:
         IS_SPEAKING.clear()
+        dashboard.status("idle")
  
  
 # ═══════════════════════════════════════════════════════════════════════════
@@ -628,8 +711,29 @@ def self_test() -> bool:
 # ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 # ═══════════════════════════════════════════════════════════════════════════
  
+# Whisper often hallucinates these when it hears background noise
+_NOISE_PHRASES = {
+    "you", "the", "a", "uh", "um", "hmm", "hm", "okay", "ok",
+    "yeah", "yes", "no", "thanks", "thank you", "bye", "goodbye",
+    "thank you.", "okay.", "yes.", "no.", "hmm.", "uh-huh",
+}
+
+def _is_noise(text: str) -> bool:
+    """Return True if the transcript is too short or a known hallucination."""
+    cleaned = text.lower().strip().rstrip(".,!?")
+    if cleaned in _NOISE_PHRASES:
+        return True
+    if len(cleaned.split()) < MIN_WORDS:
+        return True
+    return False
+
+
 def log_turn(role: str, content: str) -> None:
     conversation_history.append({"role": role, "content": content})
+    if role == "user":
+        dashboard.log(f"👤 You: {content}")
+    elif role == "assistant":
+        dashboard.log(f"🤖 Orbi: {content}")
     with MEMORY_PATH.open("a") as f:
         f.write(json.dumps({
             "ts": datetime.now().isoformat(timespec="seconds"),
@@ -640,26 +744,41 @@ def log_turn(role: str, content: str) -> None:
  
  
 def main() -> None:
+    dashboard.start()
     if not self_test():
         print("\nFix the ✗ items above, then re-run.")
         sys.exit(1)
  
     print(f"\nOrbi online. Dev mode: {DEV_MODE}. Ctrl+C to exit.\n")
     speak("Hey. I'm here.")
- 
+
+    _last_llm_call = 0.0
     while True:
         try:
             print("🎧 listening...")
             user_text = listen()
  
-            if not user_text or len(user_text.strip()) < 2:
+            if not user_text or _is_noise(user_text):
+                if user_text:
+                    print(f"  [filtered: {user_text!r}]")
+                    dashboard.log(f"  [filtered: {user_text!r}]")
                 continue
+
+            # Enforce cooldown to avoid 429s
+            elapsed = time.time() - _last_llm_call
+            if elapsed < LLM_COOLDOWN_S:
+                wait = LLM_COOLDOWN_S - elapsed
+                print(f"  [cooldown {wait:.1f}s]")
+                dashboard.log(f"  [cooldown {wait:.1f}s]")
+                time.sleep(wait)
+
             print(f"👤 You: {user_text}")
             log_turn("user", user_text)
- 
+
             reply = think(user_text)
+            _last_llm_call = time.time()
             log_turn("assistant", reply)
- 
+
             speak(reply)
  
         except KeyboardInterrupt:

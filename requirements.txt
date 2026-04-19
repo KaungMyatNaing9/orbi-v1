@@ -1,12 +1,26 @@
+# Core AI
 google-generativeai>=0.8.0
+openai>=1.30.0
+anthropic>=0.25.0
 elevenlabs>=1.0.0
-pyserial>=3.5
-opencv-python>=4.8.0
 faster-whisper>=1.0.0
-pyaudio>=0.2.13
-webrtcvad>=2.0.10
 ollama>=0.4.0
-numpy>=1.24.0
+
+# Audio
+pyaudio>=0.2.13
+webrtcvad-wheels>=2.0.10
 soundfile>=0.12.0
+
+# Vision
+opencv-python-headless>=4.8.0
+
+# Hardware
+pyserial>=3.5
+
+# Dashboard
+fastapi>=0.110.0
+uvicorn>=0.29.0
+
+# Utilities
+numpy>=1.24.0
 python-dotenv>=1.0.0
-dotenv>=0.1.0
