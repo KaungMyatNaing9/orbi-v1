@@ -594,7 +594,7 @@ def listen() -> str:
  
     try:
         mic_kwargs = dict(
-            format=pyaudio.paInt16, channels=1, rate=MIC_SAMPLE_RATE,
+            format=pyaudio.paInt16, channels=2, rate=MIC_SAMPLE_RATE,
             input=True, frames_per_buffer=frame_size,
         )
         if MIC_CARD >= 0:
@@ -618,8 +618,10 @@ def listen() -> str:
                 break
             frame = stream.read(frame_size, exception_on_overflow=False)
             total_frames += 1
+            # Downmix stereo to mono for VAD (take left channel)
+            mono_frame = np.frombuffer(frame, dtype=np.int16)[::2].tobytes()
             try:
-                is_speech = vad.is_speech(frame, MIC_SAMPLE_RATE)
+                is_speech = vad.is_speech(mono_frame, MIC_SAMPLE_RATE)
             except Exception:
                 is_speech = False
  
@@ -644,7 +646,9 @@ def listen() -> str:
         return ""
  
     audio_bytes = b"".join(voiced)
-    pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    # Downmix stereo to mono for Whisper (average both channels)
+    stereo = np.frombuffer(audio_bytes, dtype=np.int16).reshape(-1, 2)
+    pcm = stereo.mean(axis=1).astype(np.float32) / 32768.0
     segments, _ = whisper.transcribe(pcm, language="en", beam_size=1)
     return " ".join(seg.text for seg in segments).strip()
  
