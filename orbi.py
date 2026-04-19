@@ -97,6 +97,7 @@ ESP32_PORT = os.getenv("ORBI_ESP32_PORT",
     "/dev/ttyACM0")                                # EDIT on Jetson if needed
 ESP32_BAUD = 115200
 MIC_SAMPLE_RATE = 16000
+MIC_CARD = int(os.getenv("ORBI_MIC_CARD", "-1"))  # -1 = system default
 
 # --- Motor timing (tune these on real hardware) ----------------------------
 MS_PER_CM     = 20   # ms of motor run per cm  (forward / backward)
@@ -592,10 +593,13 @@ def listen() -> str:
     frame_size = int(MIC_SAMPLE_RATE * frame_duration_ms / 1000)
  
     try:
-        stream = pa.open(
+        mic_kwargs = dict(
             format=pyaudio.paInt16, channels=1, rate=MIC_SAMPLE_RATE,
             input=True, frames_per_buffer=frame_size,
         )
+        if MIC_CARD >= 0:
+            mic_kwargs["input_device_index"] = MIC_CARD
+        stream = pa.open(**mic_kwargs)
     except Exception as e:
         print(f"[listen error: {e}]")
         pa.terminate()
