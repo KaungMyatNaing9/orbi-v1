@@ -35,7 +35,8 @@ from typing import Optional
 import numpy as np
 import pyaudio
 import webrtcvad
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
 from faster_whisper import WhisperModel
@@ -155,15 +156,19 @@ IS_SPEAKING = threading.Event()
 conversation_history: list = []
  
 # Initialize cloud clients
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+_gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 eleven = ElevenLabs(api_key=ELEVENLABS_API_KEY) if ELEVENLABS_API_KEY else None
- 
-# Load local Whisper once at startup — GPU on Jetson, CPU in dev
+
+# Load local Whisper — try GPU, fall back to CPU if CTranslate2 lacks CUDA
 print("Loading Whisper...", flush=True)
 _whisper_device = "cpu" if DEV_MODE else "cuda"
 _whisper_compute = "int8" if DEV_MODE else "float16"
-whisper = WhisperModel(WHISPER_MODEL, device=_whisper_device, compute_type=_whisper_compute)
+try:
+    whisper = WhisperModel(WHISPER_MODEL, device=_whisper_device, compute_type=_whisper_compute)
+    print(f"  Whisper on {_whisper_device}", flush=True)
+except ValueError:
+    print("  CUDA not available for Whisper, falling back to CPU", flush=True)
+    whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
  
 # ═══════════════════════════════════════════════════════════════════════════
 # ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
@@ -217,11 +222,13 @@ def capture_frame() -> Optional[bytes]:
 # ═══════════════════════════════════════════════════════════════════════════
  
 def _vision_gemini(image_bytes: bytes, prompt: str) -> str:
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    resp = model.generate_content([
-        {"mime_type": "image/jpeg", "data": image_bytes},
-        prompt,
-    ])
+    resp = _gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+            prompt,
+        ],
+    )
     return resp.text.strip()
  
  
@@ -406,14 +413,13 @@ OLLAMA_TOOL_SCHEMAS = [
 # ═══════════════════════════════════════════════════════════════════════════
  
 # Persistent Gemini chat with automatic function calling
-_gemini_model = genai.GenerativeModel(
-    model_name=GEMINI_MODEL,
-    system_instruction=SOUL,
-    tools=TOOLS,
-) if GEMINI_API_KEY else None
-_gemini_chat = _gemini_model.start_chat(
-    enable_automatic_function_calling=True
-) if _gemini_model else None
+_gemini_chat = _gemini_client.chats.create(
+    model=GEMINI_MODEL,
+    config=genai_types.GenerateContentConfig(
+        system_instruction=SOUL,
+        tools=TOOLS,
+    ),
+) if _gemini_client else None
  
  
 def _think_gemini(user_text: str) -> str:
