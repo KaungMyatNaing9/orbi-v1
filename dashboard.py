@@ -348,10 +348,18 @@ class Dashboard:
             return None
 
     def start(self, host: str = "0.0.0.0", port: int = 8080):
+        import pathlib
+        cert = pathlib.Path("cert.pem")
+        key  = pathlib.Path("key.pem")
         def _run():
-            uvicorn.run(app, host=host, port=port, log_level="error")
+            if cert.exists() and key.exists():
+                uvicorn.run(app, host=host, port=port, log_level="error",
+                            ssl_certfile=str(cert), ssl_keyfile=str(key))
+            else:
+                uvicorn.run(app, host=host, port=port, log_level="error")
+        proto = "https" if (cert.exists() and key.exists()) else "http"
         threading.Thread(target=_run, daemon=True).start()
-        print(f"✓ Dashboard → http://<jetson-ip>:{port}", flush=True)
+        print(f"✓ Dashboard → {proto}://<jetson-ip>:{port}", flush=True)
 
 
 dashboard = Dashboard()
