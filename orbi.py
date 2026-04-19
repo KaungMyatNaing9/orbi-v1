@@ -579,50 +579,44 @@ def think(user_text: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
  
 def listen() -> str:
-    """Open mic, wait for speech, stop on silence, transcribe.
-    Returns transcript (possibly empty)."""
-    # If Orbi is speaking, wait until done — don't hear ourselves.
+    """Read PCM audio streamed from Mac browser, VAD-gate, transcribe with Whisper."""
     if IS_SPEAKING.is_set():
         IS_SPEAKING.wait()
         time.sleep(0.3)
 
     dashboard.status("listening")
     vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-    pa = pyaudio.PyAudio()
-    frame_duration_ms = 30
-    frame_size = int(MIC_SAMPLE_RATE * frame_duration_ms / 1000)
- 
-    try:
-        mic_kwargs = dict(
-            format=pyaudio.paInt16, channels=1, rate=MIC_SAMPLE_RATE,
-            input=True, frames_per_buffer=frame_size,
-        )
-        if MIC_CARD >= 0:
-            mic_kwargs["input_device_index"] = MIC_CARD
-        stream = pa.open(**mic_kwargs)
-    except Exception as e:
-        print(f"[listen error: {e}]")
-        pa.terminate()
-        return ""
- 
-    triggered = False
-    voiced: list = []
+
+    FRAME_SAMPLES = 480                    # 30 ms at 16 kHz
+    FRAME_BYTES   = FRAME_SAMPLES * 2      # Int16 = 2 bytes per sample
+    silence_limit = SILENCE_MS // 30
+    max_frames    = int(MAX_UTTERANCE_S * 1000 / 30)
+
+    triggered     = False
+    voiced: list  = []
     silence_frames = 0
-    silence_limit = SILENCE_MS // frame_duration_ms
-    max_frames = int(MAX_UTTERANCE_S * 1000 / frame_duration_ms)
-    total_frames = 0
- 
-    try:
-        while total_frames < max_frames:
-            if IS_SPEAKING.is_set():  # interrupted mid-listen
-                break
-            frame = stream.read(frame_size, exception_on_overflow=False)
+    total_frames  = 0
+    buf           = b""
+
+    while total_frames < max_frames:
+        if IS_SPEAKING.is_set():
+            break
+
+        chunk = dashboard.get_audio_chunk(timeout=0.5)
+        if chunk is None:
+            continue
+        buf += chunk
+
+        while len(buf) >= FRAME_BYTES:
+            frame = buf[:FRAME_BYTES]
+            buf   = buf[FRAME_BYTES:]
             total_frames += 1
+
             try:
                 is_speech = vad.is_speech(frame, MIC_SAMPLE_RATE)
             except Exception:
                 is_speech = False
- 
+
             if not triggered:
                 if is_speech:
                     triggered = True
@@ -635,14 +629,13 @@ def listen() -> str:
                     silence_frames += 1
                     if silence_frames >= silence_limit:
                         break
-    finally:
-        stream.stop_stream()
-        stream.close()
-        pa.terminate()
- 
+
+        if triggered and silence_frames >= silence_limit:
+            break
+
     if not voiced:
         return ""
- 
+
     audio_bytes = b"".join(voiced)
     pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
     segments, _ = whisper.transcribe(pcm, language="en", beam_size=1)

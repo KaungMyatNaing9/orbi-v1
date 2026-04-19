@@ -1,5 +1,6 @@
 """
 Orbi Dashboard — real-time web UI served from Jetson, viewed on Mac.
+Mac browser captures mic → streams PCM to Jetson → Whisper processes it.
 Open http://<jetson-ip>:8080 in your browser after starting orbi.py.
 """
 
@@ -36,8 +37,12 @@ _HTML = r"""<!DOCTYPE html>
   .status-thinking  { background: #1e1b4b; color: #a78bfa; border: 1px solid #a78bfa; }
   .status-speaking  { background: #1c0f00; color: #fb923c; border: 1px solid #fb923c; }
 
-  #main { display: flex; flex: 1; overflow: hidden; }
+  #mic-btn { padding: 3px 12px; border-radius: 20px; font-size: 11px; font-weight: bold;
+             letter-spacing: 1px; cursor: pointer; border: 1px solid #333;
+             background: #1a1a1a; color: #555; transition: all 0.2s; }
+  #mic-btn.active { background: #052e16; color: #4ade80; border-color: #4ade80; }
 
+  #main { display: flex; flex: 1; overflow: hidden; }
   #log-panel { flex: 1; display: flex; flex-direction: column; border-right: 1px solid #1e1e1e; }
   #log-panel h2 { padding: 8px 14px; font-size: 10px; color: #444; letter-spacing: 2px;
                   border-bottom: 1px solid #1a1a1a; flex-shrink: 0; }
@@ -51,7 +56,6 @@ _HTML = r"""<!DOCTYPE html>
   .msg-sys    { color: #3a3a3a; font-style: italic; }
 
   #right { width: 340px; display: flex; flex-direction: column; flex-shrink: 0; }
-
   #cam-panel { flex: 1; display: flex; flex-direction: column; border-bottom: 1px solid #1e1e1e; }
   #cam-panel h2 { padding: 8px 14px; font-size: 10px; color: #444; letter-spacing: 2px;
                   border-bottom: 1px solid #1a1a1a; flex-shrink: 0; }
@@ -61,7 +65,6 @@ _HTML = r"""<!DOCTYPE html>
   #cam-ph   { color: #2a2a2a; font-size: 12px; }
   #cam-desc { padding: 6px 14px 10px; font-size: 11px; color: #555; font-style: italic;
               min-height: 32px; flex-shrink: 0; }
-
   #footer { padding: 6px 14px; font-size: 10px; border-top: 1px solid #1a1a1a;
             display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
   .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
@@ -73,6 +76,7 @@ _HTML = r"""<!DOCTYPE html>
 <div id="topbar">
   <h1>ORBI</h1>
   <div id="status-badge" class="status-idle">IDLE</div>
+  <button id="mic-btn" onclick="toggleMic()">🎙 ENABLE MIC</button>
 </div>
 
 <div id="main">
@@ -104,6 +108,7 @@ const camPh   = document.getElementById('cam-ph');
 const camDesc = document.getElementById('cam-desc');
 const dot     = document.getElementById('dot');
 const connTxt = document.getElementById('conn-txt');
+const micBtn  = document.getElementById('mic-btn');
 
 function ts() { return new Date().toTimeString().slice(0, 8); }
 
@@ -124,10 +129,8 @@ function setStatus(state) {
   badge.textContent = state.toUpperCase();
 }
 
-// Audio via Web Audio API (plays on Mac browser speaker)
+// ── Playback audio (Orbi's voice) ────────────────────────────────────────────
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-document.addEventListener('click',  () => audioCtx.resume(), { once: true });
-document.addEventListener('keydown', () => audioCtx.resume(), { once: true });
 
 function playMp3(b64) {
   const bin = atob(b64);
@@ -143,6 +146,74 @@ function playMp3(b64) {
   });
 }
 
+// ── Mic capture → stream to Jetson ───────────────────────────────────────────
+let micActive = false;
+let micProcessor = null;
+let micSource = null;
+let micCtx = null;
+let micWs = null;
+
+async function toggleMic() {
+  if (micActive) {
+    stopMic();
+  } else {
+    await startMic();
+  }
+}
+
+async function startMic() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    // Request 16kHz mono — matches Whisper's expected format
+    micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    micSource = micCtx.createMediaStreamSource(stream);
+    micProcessor = micCtx.createScriptProcessor(4096, 1, 1);
+
+    micWs = new WebSocket(`ws://${location.host}/ws/mic`);
+    micWs.binaryType = 'arraybuffer';
+
+    micWs.onopen = () => {
+      addLog('🎙 Mac mic streaming to Orbi', 'msg-sys');
+    };
+    micWs.onclose = () => {
+      addLog('🎙 mic stream closed', 'msg-sys');
+      stopMic();
+    };
+
+    micProcessor.onaudioprocess = (e) => {
+      if (!micWs || micWs.readyState !== WebSocket.OPEN) return;
+      const f32 = e.inputBuffer.getChannelData(0);
+      const i16 = new Int16Array(f32.length);
+      for (let i = 0; i < f32.length; i++) {
+        const s = Math.max(-1, Math.min(1, f32[i]));
+        i16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      micWs.send(i16.buffer);
+    };
+
+    micSource.connect(micProcessor);
+    micProcessor.connect(micCtx.destination);
+
+    micActive = true;
+    micBtn.textContent = '🎙 MIC ON';
+    micBtn.classList.add('active');
+    audioCtx.resume();  // also unlock playback
+  } catch (err) {
+    addLog(`mic error: ${err.message}`, 'msg-sys');
+  }
+}
+
+function stopMic() {
+  if (micProcessor) { micProcessor.disconnect(); micProcessor = null; }
+  if (micSource)    { micSource.disconnect();    micSource = null; }
+  if (micCtx)       { micCtx.close();            micCtx = null; }
+  if (micWs)        { micWs.close();             micWs = null; }
+  micActive = false;
+  micBtn.textContent = '🎙 ENABLE MIC';
+  micBtn.classList.remove('active');
+}
+
+// ── Event WebSocket ───────────────────────────────────────────────────────────
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
 
@@ -169,18 +240,14 @@ function connect() {
                   : 'msg-sys';
         addLog(msg.text, cls);
         break;
-      case 'status':
-        setStatus(msg.state);
-        break;
+      case 'status': setStatus(msg.state); break;
       case 'vision':
         camImg.src = 'data:image/jpeg;base64,' + msg.image;
         camImg.style.display = 'block';
         camPh.style.display  = 'none';
         camDesc.textContent  = msg.description || '';
         break;
-      case 'audio':
-        playMp3(msg.data);
-        break;
+      case 'audio': playMp3(msg.data); break;
     }
   };
 }
@@ -194,6 +261,7 @@ connect();
 
 app = FastAPI()
 _queue: queue.Queue = queue.Queue()
+_mic_queue: queue.Queue = queue.Queue()
 _connections: list = []
 
 
@@ -212,6 +280,17 @@ async def ws_endpoint(websocket: WebSocket):
     except (WebSocketDisconnect, Exception):
         if websocket in _connections:
             _connections.remove(websocket)
+
+
+@app.websocket("/ws/mic")
+async def mic_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            _mic_queue.put(data)
+    except (WebSocketDisconnect, Exception):
+        pass
 
 
 async def _broadcaster():
@@ -261,6 +340,12 @@ class Dashboard:
 
     def status(self, state: str):
         self._push({"type": "status", "state": state})
+
+    def get_audio_chunk(self, timeout: float = 0.5) -> bytes | None:
+        try:
+            return _mic_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
     def start(self, host: str = "0.0.0.0", port: int = 8080):
         def _run():
