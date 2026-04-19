@@ -29,8 +29,21 @@ import time
 import base64
 import pathlib
 import threading
+import ctypes
+import ctypes.util
 from datetime import datetime
 from typing import Optional
+
+# Suppress ALSA's noisy "Unknown PCM" warnings — they are harmless probe failures
+try:
+    _asound = ctypes.cdll.LoadLibrary(ctypes.util.find_library("asound"))
+    _ALSA_ERROR_HANDLER = ctypes.CFUNCTYPE(
+        None, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_int, ctypes.c_char_p,
+    )
+    _asound.snd_lib_error_set_handler(_ALSA_ERROR_HANDLER(lambda *_: None))
+except Exception:
+    pass
  
 import numpy as np
 import pyaudio
@@ -90,10 +103,10 @@ MEMORY_PATH = pathlib.Path.home() / ".orbi" / "memory.jsonl"
 MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
  
 # --- Behavior --------------------------------------------------------------
-VAD_AGGRESSIVENESS = 3          # 0–3; 3 = most aggressive noise rejection
-SILENCE_MS = 1200               # ms of silence before utterance is considered done
+VAD_AGGRESSIVENESS = 2          # 0–3; 2 is safe for USB webcam mics
+SILENCE_MS = 900                # ms of silence before utterance is considered done
 MAX_UTTERANCE_S = 20            # safety cap on listening window
-MIN_WORDS = 3                   # ignore transcripts shorter than this
+MIN_WORDS = 2                   # ignore transcripts shorter than this
 LLM_COOLDOWN_S = 4.0            # min seconds between LLM calls (avoids 429s)
  
 # ═══════════════════════════════════════════════════════════════════════════
@@ -759,11 +772,19 @@ def main() -> None:
     speak("Hey. I'm here.")
 
     _last_llm_call = 0.0
+    _last_heartbeat = 0.0
     while True:
         try:
             print("🎧 listening...")
             user_text = listen()
- 
+
+            # Heartbeat to dashboard every 10s so it shows the system is alive
+            now = time.time()
+            if now - _last_heartbeat > 10:
+                dashboard.log("🎧 listening...")
+                dashboard.status("listening")
+                _last_heartbeat = now
+
             if not user_text or _is_noise(user_text):
                 if user_text:
                     print(f"  [filtered: {user_text!r}]")
