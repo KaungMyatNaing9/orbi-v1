@@ -250,28 +250,71 @@ def _vision_gemini(image_bytes: bytes, prompt: str) -> str:
     return resp.text.strip()
  
  
+def _vision_openai(image_bytes: bytes, prompt: str) -> str:
+    from openai import OpenAI
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    b64 = base64.b64encode(image_bytes).decode()
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        max_tokens=256,
+        messages=[{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+            {"type": "text", "text": prompt},
+        ]}],
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def _vision_claude(image_bytes: bytes, prompt: str) -> str:
+    import anthropic
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    b64 = base64.b64encode(image_bytes).decode()
+    resp = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=256,
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+            {"type": "text", "text": prompt},
+        ]}],
+    )
+    return resp.content[0].text.strip()
+
+
 def _vision_gemma(image_bytes: bytes, prompt: str) -> str:
     import ollama
     b64 = base64.b64encode(image_bytes).decode()
-    # Per Gemma 4 docs: image BEFORE text, with recommended sampling.
     resp = ollama.chat(
         model=GEMMA_LOCAL_MODEL,
         messages=[{"role": "user", "content": prompt, "images": [b64]}],
         options={"temperature": 1.0, "top_p": 0.95, "top_k": 64},
     )
     return resp["message"]["content"].strip()
- 
- 
+
+
 def vision(image_bytes: bytes, prompt: str) -> str:
-    """Ask a VLM about an image. Gemini first, Gemma fallback."""
-    try:
-        return _vision_gemini(image_bytes, prompt)
-    except Exception as e:
-        print(f"  [gemini vision failed: {e}, falling back to Gemma 4]")
+    """Multimodal vision chain: Gemini → OpenAI → Claude → local Gemma."""
+    if GEMINI_API_KEY:
         try:
-            return _vision_gemma(image_bytes, prompt)
-        except Exception as e2:
-            return f"(vision unavailable: {e2})"
+            return _vision_gemini(image_bytes, prompt)
+        except Exception as e:
+            msg = f"  [gemini vision: {e}] → OpenAI"
+            print(msg); dashboard.log(msg)
+    if OPENAI_API_KEY:
+        try:
+            return _vision_openai(image_bytes, prompt)
+        except Exception as e:
+            msg = f"  [openai vision: {e}] → Claude"
+            print(msg); dashboard.log(msg)
+    if ANTHROPIC_API_KEY:
+        try:
+            return _vision_claude(image_bytes, prompt)
+        except Exception as e:
+            msg = f"  [claude vision: {e}] → Gemma"
+            print(msg); dashboard.log(msg)
+    try:
+        return _vision_gemma(image_bytes, prompt)
+    except Exception as e:
+        return f"(vision unavailable: {e})"
  
  
 # ═══════════════════════════════════════════════════════════════════════════
