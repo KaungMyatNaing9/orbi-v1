@@ -34,14 +34,18 @@ import ctypes.util
 from datetime import datetime
 from typing import Optional
 
-# Suppress ALSA's noisy "Unknown PCM" warnings — they are harmless probe failures
+# Suppress ALSA's noisy "Unknown PCM" warnings — they are harmless probe failures.
+# _ALSA_HANDLER must be kept alive at module level; if it's a temporary, the pointer
+# gets garbage collected and ALSA calls freed memory → segfault.
 try:
     _asound = ctypes.cdll.LoadLibrary(ctypes.util.find_library("asound"))
-    _ALSA_ERROR_HANDLER = ctypes.CFUNCTYPE(
+    _ALSA_CB_TYPE = ctypes.CFUNCTYPE(
         None, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
         ctypes.c_int, ctypes.c_char_p,
     )
-    _asound.snd_lib_error_set_handler(_ALSA_ERROR_HANDLER(lambda *_: None))
+    def _alsa_noop(*_): pass
+    _ALSA_HANDLER = _ALSA_CB_TYPE(_alsa_noop)   # module-level ref keeps it alive
+    _asound.snd_lib_error_set_handler(_ALSA_HANDLER)
 except Exception:
     pass
  
